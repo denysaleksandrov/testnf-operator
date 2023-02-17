@@ -1,0 +1,21 @@
+apiVersion: crd.vmware.com/v1alpha1
+kind: Testnf
+metadata:
+  labels:
+    app.kubernetes.io/name: testnf
+    app.kubernetes.io/instance: testnf-sample
+    app.kubernetes.io/part-of: testnf-operator
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/created-by: testnf-operator
+  name: testnf-sample
+spec:
+  replicas: 1
+  image:
+    repository: vmwaresaas.jfrog.io/registry/testnf-du-flexran-base
+    tag: 2.1.0
+    pullPolicy: Always
+  annotations:
+    k8s.v1.cni.cncf.io/networks: sriov-pass
+  nodeSelectors:
+    role: high-perf
+  spec: large

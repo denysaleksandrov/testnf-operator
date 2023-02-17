@@ -1,0 +1,173 @@
+/*
+Copyright 2023.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers
+
+import (
+	"context"
+	"fmt"
+	"reflect"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	crdv1alpha1 "testnf-operator/api/v1alpha1"
+)
+
+// TestnfReconciler reconciles a Testnf object
+type TestnfReconciler struct {
+	client.Client
+	Scheme *runtime.Scheme
+}
+
+//+kubebuilder:rbac:groups=crd.vmware.com,resources=testnfs,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=crd.vmware.com,resources=testnfs/status,verbs=get;update;patch
+//+kubebuilder:rbac:groups=crd.vmware.com,resources=testnfs/finalizers,verbs=update
+
+//+kubebuilder:rbac:groups=apps,resources=deployments;replicasets;,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="",resources=pods;services;services/finalizers;endpoints;events;configmaps,verbs=create;update;get;list;watch;patch;delete
+
+// Reconcile is part of the main kubernetes reconciliation loop which aims to
+// move the current state of the cluster closer to the desired state.
+// TODO(user): Modify the Reconcile function to compare the state specified by
+// the Testnf object against the actual cluster state, and then
+// perform operations to make the cluster state reflect the state specified by
+// the user.
+//
+// For more details, check Reconcile and its Result here:
+// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.13.0/pkg/reconcile
+func (r *TestnfReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	log := log.FromContext(ctx).WithValues("Testnf", req.NamespacedName)
+
+	// Fetch the Thelper instance
+	instance := &crdv1alpha1.Testnf{}
+	err := r.Get(ctx, req.NamespacedName, instance)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			// Request object not found, could have been deleted after reconcile request.
+			// Owned objects are automatically garbage collected. For additional cleanup logic use finalizers.
+			// Return and don't requeue
+			log.Info("Testnf resource not found. Ignoring since object must be deleted.")
+			return reconcile.Result{}, nil
+		}
+		// Error reading the object - requeue the request.
+		return reconcile.Result{}, err
+	}
+
+	// Namespace could have been deleted in the middle of the reconcile
+	ns := &corev1.Namespace{}
+	err = r.Get(ctx, types.NamespacedName{Name: instance.Namespace, Namespace: corev1.NamespaceAll}, ns)
+	if (err != nil && errors.IsNotFound(err)) || (ns.Status.Phase == "Terminating") {
+		log.Info(fmt.Sprintf("The namespace '%v' does not exist or is in Terminating status, canceling Reconciling", instance.Namespace))
+		return ctrl.Result{}, nil
+	} else if err != nil {
+		log.Error(err, "Failed to check if namespace exists")
+		return ctrl.Result{}, err
+	}
+
+	if err := r.createCommonResources(log, instance, ctx); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err = r.checkPrerequisites(log, instance, ctx); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Check if this Deployment already exists
+	var result *reconcile.Result
+	found := &appsv1.Deployment{}
+	err = r.Get(ctx, types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, found)
+	if err != nil && errors.IsNotFound(err) {
+		result, err = r.ensureDeployment(req, instance, r.testnfDeployment(instance), ctx)
+		if result != nil {
+			log.Error(err, "Deployment Not ready")
+			return *result, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// This point, we have the deployment object created
+	// Ensure the deployment size is same as the spec
+	replicas := instance.Spec.Replicas
+	if *found.Spec.Replicas != *replicas {
+		found.Spec.Replicas = replicas
+		err = r.Update(ctx, found)
+		if err != nil {
+			log.Error(err, "Failed to update Deployment", "Deployment.Namespace", found.Namespace, "Deployment.Name", found.Name)
+			return ctrl.Result{}, err
+		}
+		// Spec updated return and requeue
+		// Requeue for any reason other than an error
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Update the app status with pod names
+	// List the pods for this app's deployment
+	podList := &corev1.PodList{}
+	listOpts := []client.ListOption{
+		client.InNamespace(instance.Namespace),
+		client.MatchingLabels(instance.GetLabels()),
+	}
+
+	if err = r.List(ctx, podList, listOpts...); err != nil {
+		log.Error(err, "Falied to list pods", "Testnf.Namespace", instance.Namespace, "Testnf.Name", instance.Name)
+		return ctrl.Result{}, err
+	}
+	podNames := getPodNames(podList.Items)
+
+	// Update status.Pods if needed
+	if !reflect.DeepEqual(podNames, instance.Status.Pods) {
+		instance.Status.Pods = podNames
+		err := r.Update(ctx, instance)
+		if err != nil {
+			log.Error(err, "Failed to update Testnf status")
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Check if this Service already exists
+	result, err = r.ensureService(req, instance, r.testnfService(instance), ctx)
+	if result != nil {
+		log.Error(err, "Service Not ready")
+		return *result, err
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// createIfNotExists creates a new object. If the object exists, does nothing. It returns whether the object existed before or not.
+func (r *TestnfReconciler) createIfNotExists(object client.Object) (bool, error) {
+	err := r.Create(context.TODO(), object)
+	if err != nil && errors.IsAlreadyExists(err) {
+		return true, nil
+	}
+
+	return false, err
+}
+
+// SetupWithManager sets up the controller with the Manager.
+func (r *TestnfReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&crdv1alpha1.Testnf{}).
+		Complete(r)
+}
